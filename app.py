@@ -25,12 +25,18 @@ from pptx.enum.text import PP_ALIGN
 # =====================================================================
 # CONSTANTS
 # =====================================================================
+FONT_NAME = "Avenir Next LT Pro"
+FONT_SIZE = Pt(10)
+
 SKIP_PATTERNS = [
     "comparisons of column proportions",
     "results are based on",
 ]
 
 SKIP_ANSWER_EXACT = {"topbox", "bottombox"}
+
+# Questions whose text (lowered) matches these are skipped entirely
+SKIP_QUESTION_EXACT = {"topbox", "bottombox"}
 
 DROP_ANSWER_OPTIONS = {"n", "%", "topbox", "bottombox"}
 
@@ -51,6 +57,7 @@ STACKED_COLOR_MAP = {
     "tevreden":               "#A8CD66",
     "neutraal":               "#FFC04D",
     "niet eens, niet oneens": "#FFC04D",
+    "niet eens/niet oneens":  "#FFC04D",
     "mee oneens":             "#F28E2B",
     "oneens":                 "#F28E2B",
     "slecht":                 "#F28E2B",
@@ -74,6 +81,10 @@ BOTTOM_LABELS = {
 PENULTIMATE_LABELS = {
     "anders, namelijk", "anders", "overig",
     "anders, namelijk...", "anders, namelijk:",
+    "anders, namelijk …", "anders, namelijk…",
+    "een ander netwerk, namelijk",
+    "een ander netwerk, namelijk ...",
+    "een ander netwerk, namelijk…",
 }
 
 SLIDE_WIDTH  = Inches(13.333)
@@ -108,6 +119,16 @@ def _should_skip_row(q_cell: str, a_cell: str) -> bool:
     if a_cell.lower().strip() in SKIP_ANSWER_EXACT:
         return True
     return False
+
+
+def _set_font(font, size=None, bold=False, color=None, name=FONT_NAME):
+    """Apply consistent font settings."""
+    font.name = name
+    font.size = size if size else FONT_SIZE
+    if bold:
+        font.bold = True
+    if color:
+        font.color.rgb = color
 
 
 # =====================================================================
@@ -164,6 +185,12 @@ def parse_spss_excel(uploaded_file) -> tuple[OrderedDict, list[str]]:
 
         q_key = current_q.strip()
 
+        # Skip questions like "Topbox", "Bottombox"
+        if q_key.lower().strip() in SKIP_QUESTION_EXACT:
+            current_q = None
+            current_rows = []
+            return
+
         if q_key in seen_questions:
             current_q = None
             current_rows = []
@@ -172,22 +199,31 @@ def parse_spss_excel(uploaded_file) -> tuple[OrderedDict, list[str]]:
         seen_questions.add(q_key)
         df_block = pd.DataFrame(current_rows)
 
-        n_value = "?"
-        if "_answer_" in df_block.columns:
-            n_mask = df_block["_answer_"].str.strip().str.lower() == "n"
-            if n_mask.any():
-                first_dc = data_cols[0] if data_cols else None
-                if first_dc and first_dc in df_block.columns:
-                    raw_n = df_block.loc[n_mask, first_dc].iloc[0]
-                    n_value = str(raw_n).replace(".0", "").replace("%", "").strip()
+        # Force _answer_ to clean strings
+        df_block["_answer_"] = df_block["_answer_"].fillna("").astype(str).str.strip()
+        answer_lower = df_block["_answer_"].str.lower()
 
-        keep = ~df_block["_answer_"].str.strip().str.lower().isin(DROP_ANSWER_OPTIONS)
+        # ── Extract n= value from the "n" row ──
+        n_value = "?"
+        n_mask = answer_lower == "n"
+        if n_mask.any():
+            first_dc = data_cols[0] if data_cols else None
+            if first_dc and first_dc in df_block.columns:
+                raw_n = df_block.loc[n_mask, first_dc].iloc[0]
+                n_val = str(raw_n).replace(".0", "").replace("%", "").replace(",", "").strip()
+                if n_val and n_val.lower() not in ("nan", "none", ""):
+                    n_value = n_val
+
+        # ── Drop utility rows (n, %, topbox, bottombox) ──
+        keep = ~answer_lower.isin(DROP_ANSWER_OPTIONS)
         df_clean = df_block[keep].copy()
 
+        # ── Convert percentages to float ──
         for col in data_cols:
             if col in df_clean.columns:
                 df_clean[col] = (
                     df_clean[col]
+                    .fillna("")
                     .astype(str)
                     .str.replace("%", "", regex=False)
                     .str.replace(",", ".", regex=False)
@@ -249,6 +285,7 @@ def detect_chart_type(answer_options: list[str]) -> str:
 # =====================================================================
 
 def _sort_bar_df(df: pd.DataFrame, data_cols: list[str]) -> pd.DataFrame:
+    """Sort: biggest at top, 'anders' second-from-bottom, 'weet ik niet' at bottom."""
     if not data_cols:
         return df
 
@@ -261,25 +298,28 @@ def _sort_bar_df(df: pd.DataFrame, data_cols: list[str]) -> pd.DataFrame:
     )
     normal_mask = ~(bottom_mask | penult_mask)
 
+    # Ascending sort → last in data → top of horizontal bar chart
     df_normal = df[normal_mask].sort_values(by=first_col, ascending=True)
     df_penult = df[penult_mask]
     df_bottom = df[bottom_mask]
 
+    # Order in data: bottom labels first (visual bottom), then penult, then normal
     return pd.concat([df_bottom, df_penult, df_normal], ignore_index=True)
 
 
 def _add_title_subtitle(slide, question: str, n_value: str, group_id: str):
-    tx = slide.shapes.add_textbox(Inches(0.5), Inches(0.2), Inches(12.3), Inches(0.6))
+    """Add question title and basis subtitle above the chart."""
+    # Title
+    tx = slide.shapes.add_textbox(Inches(0.5), Inches(0.2), Inches(12.3), Inches(0.8))
     tf = tx.text_frame
     tf.word_wrap = True
     p = tf.paragraphs[0]
     p.text = question
-    p.font.size = Pt(14)
-    p.font.bold = True
-    p.font.color.rgb = DARK_GREY
+    _set_font(p.font, size=Pt(10), bold=True, color=DARK_GREY)
     p.alignment = PP_ALIGN.CENTER
 
-    sx = slide.shapes.add_textbox(Inches(0.5), Inches(0.75), Inches(12.3), Inches(0.35))
+    # Subtitle: Basis
+    sx = slide.shapes.add_textbox(Inches(0.5), Inches(0.9), Inches(12.3), Inches(0.35))
     sf = sx.text_frame
     sf.word_wrap = True
     sp = sf.paragraphs[0]
@@ -287,12 +327,12 @@ def _add_title_subtitle(slide, question: str, n_value: str, group_id: str):
         sp.text = f"Basis: {group_id} (n={n_value})"
     else:
         sp.text = f"Basis: totaal (n={n_value})"
-    sp.font.size = Pt(10)
-    sp.font.color.rgb = MID_GREY
+    _set_font(sp.font, size=Pt(8), color=MID_GREY)
     sp.alignment = PP_ALIGN.CENTER
 
 
 def _clean_axes(chart):
+    """Remove gridlines, tick marks, axis lines."""
     for axis_attr in ("value_axis", "category_axis"):
         ax = getattr(chart, axis_attr, None)
         if ax is None:
@@ -300,7 +340,7 @@ def _clean_axes(chart):
         ax.has_major_gridlines = False
         ax.has_minor_gridlines = False
         try:
-            ax.major_tick_mark = 2
+            ax.major_tick_mark = 2  # NONE
             ax.minor_tick_mark = 2
         except Exception:
             pass
@@ -313,6 +353,7 @@ def _clean_axes(chart):
         chart.value_axis.visible = False
 
 
+# ── BAR CHART (horizontal clustered) ──
 def _build_bar_slide(prs, question: str, info: dict,
                      selected_cols: list[str], group_id: str):
     slide = prs.slides.add_slide(prs.slide_layouts[6])
@@ -330,6 +371,7 @@ def _build_bar_slide(prs, question: str, info: dict,
     df = _sort_bar_df(df, chart_data_cols)
     _add_title_subtitle(slide, question, n_value, group_id)
 
+    # Build chart data
     categories = df["_answer_"].tolist()
     chart_data = CategoryChartData()
     chart_data.categories = categories
@@ -338,20 +380,23 @@ def _build_bar_slide(prs, question: str, info: dict,
 
     chart_frame = slide.shapes.add_chart(
         XL_CHART_TYPE.BAR_CLUSTERED,
-        Inches(0.3), Inches(1.15), Inches(12.7), Inches(5.9),
+        Inches(0.3), Inches(1.3), Inches(12.7), Inches(5.8),
         chart_data,
     )
 
     chart = chart_frame.chart
+    chart.has_title = False
     plot = chart.plots[0]
     plot.gap_width = 60
 
     _clean_axes(chart)
 
+    # Category axis font
     if chart.category_axis:
-        chart.category_axis.tick_labels.font.size = Pt(9)
-        chart.category_axis.tick_labels.font.color.rgb = DARK_GREY
+        cat_font = chart.category_axis.tick_labels.font
+        _set_font(cat_font, color=DARK_GREY)
 
+    # Color series and add labels
     answers_lower = df["_answer_"].str.strip().str.lower().tolist()
     colors = [BAR_PRIMARY, BAR_SECONDARY, "#FF6B81", "#A855F7"]
     num_series = len(chart_data_cols)
@@ -361,29 +406,32 @@ def _build_bar_slide(prs, question: str, info: dict,
         series.format.fill.solid()
         series.format.fill.fore_color.rgb = hex_to_rgb(base_color)
 
+        # Grey override for "weet ik niet" etc.
         for pt_idx, ans in enumerate(answers_lower):
             if ans in BOTTOM_LABELS:
                 pt = series.points[pt_idx]
                 pt.format.fill.solid()
                 pt.format.fill.fore_color.rgb = hex_to_rgb(BAR_GREY)
 
+        # Data labels
         series.has_data_labels = True
         dl = series.data_labels
-        dl.font.size = Pt(9)
-        dl.font.color.rgb = DARK_GREY
+        _set_font(dl.font, color=DARK_GREY)
         dl.number_format = '0"%"'
         dl.number_format_is_linked = False
         dl.position = XL_LABEL_POSITION.OUTSIDE_END
 
+    # Legend
     if num_series <= 1:
         chart.has_legend = False
     else:
         chart.has_legend = True
         chart.legend.position = XL_LEGEND_POSITION.BOTTOM
         chart.legend.include_in_layout = False
-        chart.legend.font.size = Pt(8)
+        _set_font(chart.legend.font, size=Pt(8))
 
 
+# ── 100% STACKED HORIZONTAL ──
 def _build_stacked_slide(prs, question: str, info: dict,
                          selected_cols: list[str], group_id: str):
     slide = prs.slides.add_slide(prs.slide_layouts[6])
@@ -398,8 +446,17 @@ def _build_stacked_slide(prs, question: str, info: dict,
     if df.empty or not chart_data_cols:
         return
 
+    # Extra safety: drop any remaining n/% rows
+    df["_answer_"] = df["_answer_"].fillna("").astype(str).str.strip()
+    answer_lower = df["_answer_"].str.lower()
+    df = df[~answer_lower.isin(DROP_ANSWER_OPTIONS)].copy()
+
+    if df.empty:
+        return
+
     _add_title_subtitle(slide, question, n_value, group_id)
 
+    # For 100% stacked: categories = column headers, series = answer options
     chart_data = CategoryChartData()
     chart_data.categories = chart_data_cols
 
@@ -411,11 +468,12 @@ def _build_stacked_slide(prs, question: str, info: dict,
 
     chart_frame = slide.shapes.add_chart(
         XL_CHART_TYPE.BAR_STACKED_100,
-        Inches(0.3), Inches(1.15), Inches(12.7), Inches(5.9),
+        Inches(0.3), Inches(1.3), Inches(12.7), Inches(5.8),
         chart_data,
     )
 
     chart = chart_frame.chart
+    chart.has_title = False
     plot = chart.plots[0]
     plot.gap_width = 60
     plot.overlap = 100
@@ -423,9 +481,10 @@ def _build_stacked_slide(prs, question: str, info: dict,
     _clean_axes(chart)
 
     if chart.category_axis:
-        chart.category_axis.tick_labels.font.size = Pt(9)
-        chart.category_axis.tick_labels.font.color.rgb = DARK_GREY
+        cat_font = chart.category_axis.tick_labels.font
+        _set_font(cat_font, color=DARK_GREY)
 
+    # Color each series = answer option
     for s_idx, series in enumerate(plot.series):
         label = answer_labels[s_idx] if s_idx < len(answer_labels) else ""
         matched = _match_stacked_color(label.lower().strip())
@@ -433,18 +492,21 @@ def _build_stacked_slide(prs, question: str, info: dict,
         series.format.fill.solid()
         series.format.fill.fore_color.rgb = hex_to_rgb(color)
 
+        # Data labels: inside center, hide small values
         series.has_data_labels = True
         dl = series.data_labels
+        dl.font.name = FONT_NAME
         dl.font.size = Pt(8)
         dl.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
         dl.number_format = '[>=4]0"%";""'
         dl.number_format_is_linked = False
         dl.position = XL_LABEL_POSITION.CENTER
 
+    # Legend
     chart.has_legend = True
     chart.legend.position = XL_LEGEND_POSITION.BOTTOM
     chart.legend.include_in_layout = False
-    chart.legend.font.size = Pt(8)
+    _set_font(chart.legend.font, size=Pt(8))
 
 
 def _match_stacked_color(text: str) -> str | None:
@@ -457,6 +519,7 @@ def _match_stacked_color(text: str) -> str | None:
     return None
 
 
+# ── Main generator ──
 def generate_pptx(questions_data: OrderedDict, config_df: pd.DataFrame,
                   selected_cols: list[str]) -> bytes:
     prs = Presentation()
