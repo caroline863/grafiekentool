@@ -28,17 +28,22 @@ from pptx.enum.text import PP_ALIGN
 FONT_NAME = "Avenir Next LT Pro"
 FONT_SIZE = Pt(10)
 
+# Patterns in question+answer text that indicate a row should be SKIPPED
+# entirely (these rows act as block separators — they trigger _flush).
 SKIP_PATTERNS = [
     "comparisons of column proportions",
     "results are based on",
 ]
 
-SKIP_ANSWER_EXACT = {"topbox", "bottombox"}
-
-# Questions whose text (lowered) matches these are skipped entirely
+# Question-level skip: if the QUESTION text itself equals one of these,
+# the entire question block is discarded.
 SKIP_QUESTION_EXACT = {"topbox", "bottombox"}
 
-DROP_ANSWER_OPTIONS = {"n", "%", "topbox", "bottombox"}
+# Answer-level utility rows: these are collected into the block (so we
+# can extract n=) but are DROPPED from the chart data afterwards.
+# IMPORTANT: do NOT put these in SKIP_ANSWER_EXACT — that would flush
+# the block prematurely and orphan any rows that come after.
+DROP_ANSWER_OPTIONS = {"n", "%", "topbox", "bottombox", "top2box", "bottom2box"}
 
 STACKED_KEYWORDS = [
     "eens", "oneens", "goed", "slecht", "vaak", "nooit",
@@ -107,27 +112,69 @@ def _is_empty(val) -> bool:
         return True
     if isinstance(val, float) and pd.isna(val):
         return True
-    s = _normalize(str(val))
+    s = str(val).replace("\xa0", " ").strip().lower()
     return s in ("", "nan", "none")
 
 
-def _normalize(s: str) -> str:
-    """Strip whitespace, non-breaking spaces, and lowercase."""
-    return s.replace("\xa0", " ").strip().lower()
+def _clean_answer(raw: str) -> str:
+    """Aggressively clean an answer string."""
+    return (
+        str(raw)
+        .replace("\xa0", " ")
+        .replace("\r\n", "\n")
+        .replace("\r", "\n")
+        .strip()
+    )
+
+
+def _is_utility_row(answer: str) -> bool:
+    """Check if this is a utility row (n, %, topbox, bottombox, etc.).
+
+    Handles multi-line values like 'n\\n%', hidden characters, padding.
+    """
+    clean = _clean_answer(answer).lower()
+
+    # Exact match
+    if clean in DROP_ANSWER_OPTIONS:
+        return True
+
+    # Multi-line: split on newlines and check if ALL parts are utility
+    parts = [p.strip() for p in clean.split("\n") if p.strip()]
+    if parts and all(p in DROP_ANSWER_OPTIONS for p in parts):
+        return True
+
+    # Combined like "n %" or "n%"
+    if re.match(r'^[n%\s]+$', clean) and len(clean) <= 5:
+        return True
+
+    return False
+
+
+def _row_has_n(answer: str) -> bool:
+    """Check if this answer row represents an 'n' (sample size) row."""
+    clean = _clean_answer(answer).lower()
+    if clean == "n":
+        return True
+    # Multi-line: one of the parts is "n"
+    parts = [p.strip() for p in clean.split("\n") if p.strip()]
+    return "n" in parts
 
 
 def _should_skip_row(q_cell: str, a_cell: str) -> bool:
+    """Check if a row should be SKIPPED entirely (acts as block separator).
+
+    Only use this for truly separating content like footnotes.
+    Do NOT use this for n/% /topbox/bottombox — those must stay in the
+    block so n= can be extracted before they are filtered out.
+    """
     combined = (q_cell + " " + a_cell).lower().strip()
     for pat in SKIP_PATTERNS:
         if pat in combined:
             return True
-    if a_cell.lower().strip() in SKIP_ANSWER_EXACT:
-        return True
     return False
 
 
 def _set_font(font, size=None, bold=False, color=None, name=FONT_NAME):
-    """Apply consistent font settings."""
     font.name = name
     font.size = size if size else FONT_SIZE
     if bold:
@@ -145,12 +192,16 @@ def parse_spss_excel(uploaded_file) -> tuple[OrderedDict, list[str]]:
     row0 = raw.iloc[0].fillna("").astype(str).str.strip()
     row1 = raw.iloc[1].fillna("").astype(str).str.strip()
 
+    # Build column names from the two header rows
     col_names: list[str] = []
     current_main = ""
+    # Characters that act as placeholder sub-headers (not real names)
+    placeholder_subs = {"nan", "", "_", "-", "–", "—"}
+
     for idx, (main, sub) in enumerate(zip(row0, row1)):
         if main and main.lower() != "nan":
             current_main = main
-        if sub and sub.lower() not in ("nan", "", "_"):
+        if sub and sub.lower() not in placeholder_subs:
             col_names.append(sub)
         elif current_main:
             col_names.append(current_main)
@@ -160,6 +211,7 @@ def parse_spss_excel(uploaded_file) -> tuple[OrderedDict, list[str]]:
     col_names[0] = "_question_"
     col_names[1] = "_answer_"
 
+    # De-duplicate data column names
     seen_names: dict[str, int] = {}
     for i, name in enumerate(col_names):
         if i < 2:
@@ -190,7 +242,6 @@ def parse_spss_excel(uploaded_file) -> tuple[OrderedDict, list[str]]:
 
         q_key = current_q.strip()
 
-        # Skip questions like "Topbox", "Bottombox"
         if q_key.lower().strip() in SKIP_QUESTION_EXACT:
             current_q = None
             current_rows = []
@@ -204,69 +255,77 @@ def parse_spss_excel(uploaded_file) -> tuple[OrderedDict, list[str]]:
         seen_questions.add(q_key)
         df_block = pd.DataFrame(current_rows)
 
-        # Force _answer_ to clean strings (strip non-breaking spaces too)
+        # Force _answer_ to clean strings
         df_block["_answer_"] = (
             df_block["_answer_"]
             .fillna("")
             .astype(str)
-            .str.replace("\xa0", " ", regex=False)
-            .str.strip()
+            .apply(_clean_answer)
         )
-        answer_lower = df_block["_answer_"].str.lower().str.strip()
 
-        # ── Extract n= value from the "n" row ──
+        # ── Extract n= value BEFORE dropping utility rows ──
         n_value = "?"
-        n_mask = answer_lower == "n"
-        if n_mask.any():
-            # Try each data column until we find a numeric n value
-            for dc in data_cols:
-                if dc not in df_block.columns:
-                    continue
-                raw_n = df_block.loc[n_mask, dc].iloc[0]
-                n_val = (
-                    str(raw_n)
-                    .replace(".0", "")
-                    .replace("%", "")
-                    .replace(",", "")
-                    .replace("\xa0", "")
-                    .strip()
-                )
-                if n_val and n_val.lower() not in ("nan", "none", ""):
-                    n_value = n_val
+        for idx_row in range(len(df_block)):
+            ans = df_block.iloc[idx_row]["_answer_"]
+            if _row_has_n(ans):
+                # Try first available data column for the n value
+                for dc in data_cols:
+                    if dc not in df_block.columns:
+                        continue
+                    raw_n = df_block.iloc[idx_row][dc]
+                    if _is_empty(raw_n):
+                        continue
+                    n_str = (
+                        str(raw_n)
+                        .replace("%", "")
+                        .replace(",", "")
+                        .replace("\xa0", "")
+                        .strip()
+                    )
+                    try:
+                        n_num = int(float(n_str))
+                        if n_num > 0:
+                            n_value = str(n_num)
+                            break
+                    except (ValueError, TypeError):
+                        continue
+                if n_value != "?":
                     break
 
         # ── Drop utility rows (n, %, topbox, bottombox) ──
-        keep = ~answer_lower.isin(DROP_ANSWER_OPTIONS)
-        df_clean = df_block[keep].copy()
+        keep_mask = ~df_block["_answer_"].apply(_is_utility_row)
+        df_clean = df_block[keep_mask].copy()
 
-        # Extra safety: also drop rows where the answer is purely "n" or "%"
-        # even with surrounding whitespace or encoding issues
-        df_clean = df_clean[
-            ~df_clean["_answer_"].str.lower().str.strip().isin(DROP_ANSWER_OPTIONS)
-        ].copy()
+        # ── Convert data columns to numeric percentages ──
+        for col in data_cols:
+            if col not in df_clean.columns:
+                continue
 
-        # ── Convert percentages to float ──
+            # Clean string values
+            series = (
+                df_clean[col]
+                .fillna("")
+                .astype(str)
+                .str.replace("%", "", regex=False)
+                .str.replace(",", ".", regex=False)
+                .str.replace("\xa0", "", regex=False)
+                .str.strip()
+            )
+            df_clean[col] = pd.to_numeric(series, errors="coerce")
+
+        # If all values are in 0-1 range (decimals), scale to 0-100
+        all_vals = []
         for col in data_cols:
             if col in df_clean.columns:
-                df_clean[col] = (
-                    df_clean[col]
-                    .fillna("")
-                    .astype(str)
-                    .str.replace("%", "", regex=False)
-                    .str.replace(",", ".", regex=False)
-                    .str.replace("\xa0", "", regex=False)
-                    .str.strip()
-                )
-                df_clean[col] = pd.to_numeric(df_clean[col], errors="coerce")
-
-        # If all values look like decimals (0-1 range), multiply by 100
-        for col in data_cols:
-            if col in df_clean.columns:
-                valid = df_clean[col].dropna()
-                if len(valid) > 0 and valid.max() <= 1.0:
+                all_vals.extend(df_clean[col].dropna().tolist())
+        if all_vals and max(all_vals) <= 1.0:
+            for col in data_cols:
+                if col in df_clean.columns:
                     df_clean[col] = df_clean[col] * 100
 
         answer_opts = df_clean["_answer_"].dropna().str.strip().tolist()
+        # Extra filter: remove any answer that is empty after cleaning
+        answer_opts = [a for a in answer_opts if a]
 
         questions[q_key] = {
             "df": df_clean.reset_index(drop=True),
@@ -281,19 +340,23 @@ def parse_spss_excel(uploaded_file) -> tuple[OrderedDict, list[str]]:
         q_cell = str(row["_question_"]).strip() if not _is_empty(row["_question_"]) else ""
         a_cell = str(row["_answer_"]).strip() if not _is_empty(row["_answer_"]) else ""
 
+        # Skip footnote rows (these ARE block separators)
         if _should_skip_row(q_cell, a_cell):
             _flush()
             current_q = None
             continue
 
+        # Empty row = end of block
         if not q_cell and not a_cell:
             _flush()
             continue
 
+        # New question starts
         if q_cell:
             _flush()
             current_q = q_cell
 
+        # Add row to current block (including n/% — they'll be filtered later)
         if current_q is not None and a_cell:
             current_rows.append(row.to_dict())
 
@@ -320,7 +383,6 @@ def detect_chart_type(answer_options: list[str]) -> str:
 # =====================================================================
 
 def _sort_bar_df(df: pd.DataFrame, data_cols: list[str]) -> pd.DataFrame:
-    """Sort: biggest at top, 'anders' second-from-bottom, 'weet ik niet' at bottom."""
     if not data_cols:
         return df
 
@@ -333,18 +395,14 @@ def _sort_bar_df(df: pd.DataFrame, data_cols: list[str]) -> pd.DataFrame:
     )
     normal_mask = ~(bottom_mask | penult_mask)
 
-    # Ascending sort → last in data → top of horizontal bar chart
     df_normal = df[normal_mask].sort_values(by=first_col, ascending=True)
     df_penult = df[penult_mask]
     df_bottom = df[bottom_mask]
 
-    # Order in data: bottom labels first (visual bottom), then penult, then normal
     return pd.concat([df_bottom, df_penult, df_normal], ignore_index=True)
 
 
 def _add_title_subtitle(slide, question: str, n_value: str, group_id: str):
-    """Add question title and basis subtitle tight above the chart area."""
-    # Title — positioned just above the chart
     tx = slide.shapes.add_textbox(Inches(0.5), Inches(0.15), Inches(12.3), Inches(0.5))
     tf = tx.text_frame
     tf.word_wrap = True
@@ -353,7 +411,6 @@ def _add_title_subtitle(slide, question: str, n_value: str, group_id: str):
     _set_font(p.font, size=Pt(10), bold=True, color=DARK_GREY)
     p.alignment = PP_ALIGN.CENTER
 
-    # Subtitle: Basis — directly below title
     basis_text = f"Basis: {group_id} (n={n_value})" if group_id else f"Basis: totaal (n={n_value})"
     p2 = tf.add_paragraph()
     p2.text = basis_text
@@ -362,7 +419,6 @@ def _add_title_subtitle(slide, question: str, n_value: str, group_id: str):
 
 
 def _clean_axes(chart):
-    """Remove gridlines, tick marks, axis lines."""
     for axis_attr in ("value_axis", "category_axis"):
         ax = getattr(chart, axis_attr, None)
         if ax is None:
@@ -383,7 +439,6 @@ def _clean_axes(chart):
         chart.value_axis.visible = False
 
 
-# ── BAR CHART (horizontal clustered) ──
 def _build_bar_slide(prs, question: str, info: dict,
                      selected_cols: list[str], group_id: str):
     slide = prs.slides.add_slide(prs.slide_layouts[6])
@@ -398,10 +453,14 @@ def _build_bar_slide(prs, question: str, info: dict,
     if df.empty or not chart_data_cols:
         return
 
+    # Extra safety: drop any remaining utility rows
+    df = df[~df["_answer_"].apply(_is_utility_row)].copy()
+    if df.empty:
+        return
+
     df = _sort_bar_df(df, chart_data_cols)
     _add_title_subtitle(slide, question, n_value, group_id)
 
-    # Build chart data
     categories = df["_answer_"].tolist()
     chart_data = CategoryChartData()
     chart_data.categories = categories
@@ -421,12 +480,10 @@ def _build_bar_slide(prs, question: str, info: dict,
 
     _clean_axes(chart)
 
-    # Category axis font
     if chart.category_axis:
         cat_font = chart.category_axis.tick_labels.font
         _set_font(cat_font, color=DARK_GREY)
 
-    # Color series and add labels
     answers_lower = df["_answer_"].str.strip().str.lower().tolist()
     colors = [BAR_PRIMARY, BAR_SECONDARY, "#FF6B81", "#A855F7"]
     num_series = len(chart_data_cols)
@@ -436,14 +493,13 @@ def _build_bar_slide(prs, question: str, info: dict,
         series.format.fill.solid()
         series.format.fill.fore_color.rgb = hex_to_rgb(base_color)
 
-        # Grey override for "weet ik niet" etc.
         for pt_idx, ans in enumerate(answers_lower):
             if ans in BOTTOM_LABELS:
                 pt = series.points[pt_idx]
                 pt.format.fill.solid()
                 pt.format.fill.fore_color.rgb = hex_to_rgb(BAR_GREY)
 
-        # Data labels — percentage outside bar end
+        # Data labels with percentage at the end of each bar
         series.has_data_labels = True
         dl = series.data_labels
         dl.font.name = FONT_NAME
@@ -456,7 +512,6 @@ def _build_bar_slide(prs, question: str, info: dict,
         except Exception:
             pass
 
-    # Legend
     if num_series <= 1:
         chart.has_legend = False
     else:
@@ -466,7 +521,6 @@ def _build_bar_slide(prs, question: str, info: dict,
         _set_font(chart.legend.font, size=Pt(8))
 
 
-# ── 100% STACKED HORIZONTAL ──
 def _build_stacked_slide(prs, question: str, info: dict,
                          selected_cols: list[str], group_id: str):
     slide = prs.slides.add_slide(prs.slide_layouts[6])
@@ -481,17 +535,13 @@ def _build_stacked_slide(prs, question: str, info: dict,
     if df.empty or not chart_data_cols:
         return
 
-    # Extra safety: drop any remaining n/% rows
-    df["_answer_"] = df["_answer_"].fillna("").astype(str).str.strip()
-    answer_lower = df["_answer_"].str.lower()
-    df = df[~answer_lower.isin(DROP_ANSWER_OPTIONS)].copy()
-
+    # Extra safety: drop any remaining utility rows
+    df = df[~df["_answer_"].apply(_is_utility_row)].copy()
     if df.empty:
         return
 
     _add_title_subtitle(slide, question, n_value, group_id)
 
-    # For 100% stacked: categories = column headers, series = answer options
     chart_data = CategoryChartData()
     chart_data.categories = chart_data_cols
 
@@ -519,7 +569,6 @@ def _build_stacked_slide(prs, question: str, info: dict,
         cat_font = chart.category_axis.tick_labels.font
         _set_font(cat_font, color=DARK_GREY)
 
-    # Color each series = answer option
     for s_idx, series in enumerate(plot.series):
         label = answer_labels[s_idx] if s_idx < len(answer_labels) else ""
         matched = _match_stacked_color(label.lower().strip())
@@ -527,7 +576,6 @@ def _build_stacked_slide(prs, question: str, info: dict,
         series.format.fill.solid()
         series.format.fill.fore_color.rgb = hex_to_rgb(color)
 
-        # Data labels: inside center, hide small values
         series.has_data_labels = True
         dl = series.data_labels
         dl.font.name = FONT_NAME
@@ -537,7 +585,6 @@ def _build_stacked_slide(prs, question: str, info: dict,
         dl.number_format_is_linked = False
         dl.position = XL_LABEL_POSITION.CENTER
 
-    # Legend
     chart.has_legend = True
     chart.legend.position = XL_LEGEND_POSITION.BOTTOM
     chart.legend.include_in_layout = False
@@ -554,7 +601,6 @@ def _match_stacked_color(text: str) -> str | None:
     return None
 
 
-# ── Main generator ──
 def generate_pptx(questions_data: OrderedDict, config_df: pd.DataFrame,
                   selected_cols: list[str]) -> bytes:
     prs = Presentation()
@@ -604,6 +650,8 @@ def main():
                         questions, data_cols = parse_spss_excel(uploaded)
                     except Exception as e:
                         st.error(f"Fout bij het inlezen: {e}")
+                        import traceback
+                        st.code(traceback.format_exc())
                         return
 
                 st.session_state.questions = questions
@@ -661,12 +709,14 @@ def main():
 
     st.session_state.config_df = edited
 
-    with st.expander("Voorbeeld data per vraag"):
+    # ── Debug info (collapsed) ──
+    with st.expander("Debug: data per vraag"):
         questions = st.session_state.questions
-        q_choice = st.selectbox("Kies een vraag", list(questions.keys()))
+        q_choice = st.selectbox("Kies een vraag", list(questions.keys()), key="debug_q")
         if q_choice:
             info = questions[q_choice]
-            st.write(f"**n = {info['n_value']}** | Antwoorden: {len(info['answer_options'])}")
+            st.write(f"**n = {info['n_value']}**")
+            st.write(f"**Antwoordopties ({len(info['answer_options'])}):** {info['answer_options']}")
             display_df = info["df"].drop(columns=["_question_"], errors="ignore")
             st.dataframe(display_df, use_container_width=True, hide_index=True)
 
@@ -691,6 +741,8 @@ def main():
                 )
             except Exception as e:
                 st.error(f"Fout bij genereren: {e}")
+                import traceback
+                st.code(traceback.format_exc())
                 return
 
         st.success("PowerPoint is klaar!")
