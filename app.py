@@ -107,8 +107,13 @@ def _is_empty(val) -> bool:
         return True
     if isinstance(val, float) and pd.isna(val):
         return True
-    s = str(val).strip().lower()
+    s = _normalize(str(val))
     return s in ("", "nan", "none")
+
+
+def _normalize(s: str) -> str:
+    """Strip whitespace, non-breaking spaces, and lowercase."""
+    return s.replace("\xa0", " ").strip().lower()
 
 
 def _should_skip_row(q_cell: str, a_cell: str) -> bool:
@@ -199,24 +204,46 @@ def parse_spss_excel(uploaded_file) -> tuple[OrderedDict, list[str]]:
         seen_questions.add(q_key)
         df_block = pd.DataFrame(current_rows)
 
-        # Force _answer_ to clean strings
-        df_block["_answer_"] = df_block["_answer_"].fillna("").astype(str).str.strip()
-        answer_lower = df_block["_answer_"].str.lower()
+        # Force _answer_ to clean strings (strip non-breaking spaces too)
+        df_block["_answer_"] = (
+            df_block["_answer_"]
+            .fillna("")
+            .astype(str)
+            .str.replace("\xa0", " ", regex=False)
+            .str.strip()
+        )
+        answer_lower = df_block["_answer_"].str.lower().str.strip()
 
         # ── Extract n= value from the "n" row ──
         n_value = "?"
         n_mask = answer_lower == "n"
         if n_mask.any():
-            first_dc = data_cols[0] if data_cols else None
-            if first_dc and first_dc in df_block.columns:
-                raw_n = df_block.loc[n_mask, first_dc].iloc[0]
-                n_val = str(raw_n).replace(".0", "").replace("%", "").replace(",", "").strip()
+            # Try each data column until we find a numeric n value
+            for dc in data_cols:
+                if dc not in df_block.columns:
+                    continue
+                raw_n = df_block.loc[n_mask, dc].iloc[0]
+                n_val = (
+                    str(raw_n)
+                    .replace(".0", "")
+                    .replace("%", "")
+                    .replace(",", "")
+                    .replace("\xa0", "")
+                    .strip()
+                )
                 if n_val and n_val.lower() not in ("nan", "none", ""):
                     n_value = n_val
+                    break
 
         # ── Drop utility rows (n, %, topbox, bottombox) ──
         keep = ~answer_lower.isin(DROP_ANSWER_OPTIONS)
         df_clean = df_block[keep].copy()
+
+        # Extra safety: also drop rows where the answer is purely "n" or "%"
+        # even with surrounding whitespace or encoding issues
+        df_clean = df_clean[
+            ~df_clean["_answer_"].str.lower().str.strip().isin(DROP_ANSWER_OPTIONS)
+        ].copy()
 
         # ── Convert percentages to float ──
         for col in data_cols:
@@ -227,9 +254,17 @@ def parse_spss_excel(uploaded_file) -> tuple[OrderedDict, list[str]]:
                     .astype(str)
                     .str.replace("%", "", regex=False)
                     .str.replace(",", ".", regex=False)
+                    .str.replace("\xa0", "", regex=False)
                     .str.strip()
                 )
                 df_clean[col] = pd.to_numeric(df_clean[col], errors="coerce")
+
+        # If all values look like decimals (0-1 range), multiply by 100
+        for col in data_cols:
+            if col in df_clean.columns:
+                valid = df_clean[col].dropna()
+                if len(valid) > 0 and valid.max() <= 1.0:
+                    df_clean[col] = df_clean[col] * 100
 
         answer_opts = df_clean["_answer_"].dropna().str.strip().tolist()
 
@@ -308,9 +343,9 @@ def _sort_bar_df(df: pd.DataFrame, data_cols: list[str]) -> pd.DataFrame:
 
 
 def _add_title_subtitle(slide, question: str, n_value: str, group_id: str):
-    """Add question title and basis subtitle above the chart."""
-    # Title
-    tx = slide.shapes.add_textbox(Inches(0.5), Inches(0.2), Inches(12.3), Inches(0.8))
+    """Add question title and basis subtitle tight above the chart area."""
+    # Title — positioned just above the chart
+    tx = slide.shapes.add_textbox(Inches(0.5), Inches(0.15), Inches(12.3), Inches(0.5))
     tf = tx.text_frame
     tf.word_wrap = True
     p = tf.paragraphs[0]
@@ -318,17 +353,12 @@ def _add_title_subtitle(slide, question: str, n_value: str, group_id: str):
     _set_font(p.font, size=Pt(10), bold=True, color=DARK_GREY)
     p.alignment = PP_ALIGN.CENTER
 
-    # Subtitle: Basis
-    sx = slide.shapes.add_textbox(Inches(0.5), Inches(0.9), Inches(12.3), Inches(0.35))
-    sf = sx.text_frame
-    sf.word_wrap = True
-    sp = sf.paragraphs[0]
-    if group_id:
-        sp.text = f"Basis: {group_id} (n={n_value})"
-    else:
-        sp.text = f"Basis: totaal (n={n_value})"
-    _set_font(sp.font, size=Pt(8), color=MID_GREY)
-    sp.alignment = PP_ALIGN.CENTER
+    # Subtitle: Basis — directly below title
+    basis_text = f"Basis: {group_id} (n={n_value})" if group_id else f"Basis: totaal (n={n_value})"
+    p2 = tf.add_paragraph()
+    p2.text = basis_text
+    _set_font(p2.font, size=Pt(8), color=MID_GREY)
+    p2.alignment = PP_ALIGN.CENTER
 
 
 def _clean_axes(chart):
@@ -380,7 +410,7 @@ def _build_bar_slide(prs, question: str, info: dict,
 
     chart_frame = slide.shapes.add_chart(
         XL_CHART_TYPE.BAR_CLUSTERED,
-        Inches(0.3), Inches(1.3), Inches(12.7), Inches(5.8),
+        Inches(0.3), Inches(0.8), Inches(12.7), Inches(6.3),
         chart_data,
     )
 
@@ -413,13 +443,18 @@ def _build_bar_slide(prs, question: str, info: dict,
                 pt.format.fill.solid()
                 pt.format.fill.fore_color.rgb = hex_to_rgb(BAR_GREY)
 
-        # Data labels
+        # Data labels — percentage outside bar end
         series.has_data_labels = True
         dl = series.data_labels
-        _set_font(dl.font, color=DARK_GREY)
+        dl.font.name = FONT_NAME
+        dl.font.size = Pt(9)
+        dl.font.color.rgb = DARK_GREY
         dl.number_format = '0"%"'
         dl.number_format_is_linked = False
-        dl.position = XL_LABEL_POSITION.OUTSIDE_END
+        try:
+            dl.position = XL_LABEL_POSITION.OUTSIDE_END
+        except Exception:
+            pass
 
     # Legend
     if num_series <= 1:
@@ -468,7 +503,7 @@ def _build_stacked_slide(prs, question: str, info: dict,
 
     chart_frame = slide.shapes.add_chart(
         XL_CHART_TYPE.BAR_STACKED_100,
-        Inches(0.3), Inches(1.3), Inches(12.7), Inches(5.8),
+        Inches(0.3), Inches(0.8), Inches(12.7), Inches(6.3),
         chart_data,
     )
 
