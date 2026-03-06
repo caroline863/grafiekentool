@@ -76,6 +76,8 @@ STACKED_COLOR_MAP = {
     "geen mening":            "#808080",
 }
 
+STACKED_SCALE_COLORS = ["#39B54A", "#A8CD66", "#FFC04D", "#F28E2B", "#E1001A", "#808080"]
+
 BAR_PRIMARY   = "#C60651"
 BAR_SECONDARY = "#FF85A2"
 BAR_GREY      = "#D3D3D3"
@@ -414,8 +416,9 @@ def _set_chart_title(chart, question: str, n_value: str, group_id: str):
 
     basis_text = f"Basis: {group_id} (n={n_value})" if group_id else f"Basis: totaal (n={n_value})"
     p2 = tf.add_paragraph()
-    p2.text = basis_text
-    _set_font(p2.font, size=Pt(10), bold=False, color=MID_GREY)
+    run2 = p2.add_run()
+    run2.text = basis_text
+    _set_font(run2.font, size=Pt(10), bold=False, color=MID_GREY)
     p2.alignment = PP_ALIGN.CENTER
 
 
@@ -577,10 +580,11 @@ def _build_stacked_slide(prs, question: str, info: dict,
         cat_font = chart.category_axis.tick_labels.font
         _set_font(cat_font, size=Pt(10), color=DARK_GREY)
 
+    num_answers = len(answer_labels)
     for s_idx, series in enumerate(plot.series):
-        label = answer_labels[s_idx] if s_idx < len(answer_labels) else ""
+        label = answer_labels[s_idx] if s_idx < num_answers else ""
         matched = _match_stacked_color(label.lower().strip())
-        color = matched if matched else BAR_PRIMARY
+        color = matched if matched else _get_stacked_position_color(s_idx, num_answers)
         series.format.fill.solid()
         series.format.fill.fore_color.rgb = hex_to_rgb(color)
 
@@ -610,6 +614,16 @@ def _match_stacked_color(text: str) -> str | None:
         if key in text or text in key:
             return color
     return None
+
+
+def _get_stacked_position_color(idx: int, total: int) -> str:
+    """Fallback scale color based on position (green -> red) for stacked charts."""
+    if total <= 1:
+        return STACKED_SCALE_COLORS[0]
+    scale = STACKED_SCALE_COLORS[:5]  # exclude grey
+    pos = idx / (total - 1)
+    scale_idx = min(int(pos * (len(scale) - 1) + 0.5), len(scale) - 1)
+    return scale[scale_idx]
 
 
 def _build_grouped_stacked_slide(prs, group_questions: list[tuple[str, dict]],
@@ -683,10 +697,11 @@ def _build_grouped_stacked_slide(prs, group_questions: list[tuple[str, dict]],
         cat_font = chart.category_axis.tick_labels.font
         _set_font(cat_font, size=Pt(10), color=DARK_GREY)
 
+    num_answers = len(all_answers)
     for s_idx, series in enumerate(plot.series):
-        label = all_answers[s_idx] if s_idx < len(all_answers) else ""
+        label = all_answers[s_idx] if s_idx < num_answers else ""
         matched = _match_stacked_color(label.lower().strip())
-        color = matched if matched else BAR_PRIMARY
+        color = matched if matched else _get_stacked_position_color(s_idx, num_answers)
         series.format.fill.solid()
         series.format.fill.fore_color.rgb = hex_to_rgb(color)
 
@@ -850,7 +865,7 @@ def generate_pptx(questions_data: OrderedDict, config_df: pd.DataFrame,
                     group_questions.append((q2, questions_data[q2]))
 
             if len(group_questions) <= 1:
-                # Single question in group → treat as individual
+                # Single question in group -> treat as individual
                 if chart_type == "100% Gestapeld horizontaal":
                     _build_stacked_slide(prs, q_text, info, selected_cols, group_id)
                 else:
@@ -876,8 +891,8 @@ def generate_pptx(questions_data: OrderedDict, config_df: pd.DataFrame,
 # 4. STREAMLIT APP
 # =====================================================================
 def main():
-    st.set_page_config(page_title="SPSS -> PowerPoint", layout="wide")
-    st.title("SPSS Excel -> PowerPoint Rapportage")
+    st.set_page_config(page_title="Ruigrok - Grafiek Builder", layout="wide")
+    st.title("Ruigrok - Grafiek Builder")
 
     with st.sidebar:
         st.header("1. Upload Excel")
