@@ -177,8 +177,7 @@ def _should_skip_row(q_cell: str, a_cell: str) -> bool:
 def _set_font(font, size=None, bold=False, color=None, name=FONT_NAME):
     font.name = name
     font.size = size if size else FONT_SIZE
-    if bold:
-        font.bold = True
+    font.bold = bold
     if color:
         font.color.rgb = color
 
@@ -465,7 +464,8 @@ def _build_bar_slide(prs, question: str, info: dict,
     categories = df["_answer_"].tolist()
     chart_data = CategoryChartData()
     chart_data.categories = categories
-    for col in chart_data_cols:
+    # Reverse series order so visual top-to-bottom matches selection order
+    for col in reversed(chart_data_cols):
         chart_data.add_series(col, df[col].fillna(0).tolist())
 
     # Position chart within slide guides (~0.5" margins)
@@ -491,7 +491,9 @@ def _build_bar_slide(prs, question: str, info: dict,
     num_series = len(chart_data_cols)
 
     for s_idx, series in enumerate(plot.series):
-        base_color = colors[s_idx % len(colors)]
+        # Map colors so first selected column gets primary color
+        color_idx = num_series - 1 - s_idx
+        base_color = colors[color_idx % len(colors)]
         series.format.fill.solid()
         series.format.fill.fore_color.rgb = hex_to_rgb(base_color)
 
@@ -504,9 +506,12 @@ def _build_bar_slide(prs, question: str, info: dict,
         # Data labels — percentage at end of each bar
         series.has_data_labels = True
         dl = series.data_labels
+        dl.show_value = True
+        dl.show_category_name = False
+        dl.show_series_name = False
         dl.font.name = FONT_NAME
         dl.font.size = Pt(10)
-        dl.font.color.rgb = DARK_GREY
+        dl.font.color.rgb = RGBColor(0x00, 0x00, 0x00)
         dl.number_format = '0"%"'
         dl.number_format_is_linked = False
         try:
@@ -543,12 +548,14 @@ def _build_stacked_slide(prs, question: str, info: dict,
         return
 
     chart_data = CategoryChartData()
-    chart_data.categories = chart_data_cols
+    # Reverse category order so visual top-to-bottom matches selection order
+    display_cols = list(reversed(chart_data_cols))
+    chart_data.categories = display_cols
 
     answer_labels = df["_answer_"].str.strip().tolist()
     for _, row in df.iterrows():
         label = str(row["_answer_"]).strip()
-        vals = [float(row[c]) if pd.notna(row[c]) else 0.0 for c in chart_data_cols]
+        vals = [float(row[c]) if pd.notna(row[c]) else 0.0 for c in display_cols]
         chart_data.add_series(label, vals)
 
     # Position chart within slide guides (~0.5" margins)
@@ -579,10 +586,13 @@ def _build_stacked_slide(prs, question: str, info: dict,
 
         series.has_data_labels = True
         dl = series.data_labels
+        dl.show_value = True
+        dl.show_category_name = False
+        dl.show_series_name = False
         dl.font.name = FONT_NAME
         dl.font.size = Pt(10)
-        dl.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
-        dl.number_format = '[>=4]0"%";""'
+        dl.font.color.rgb = RGBColor(0x00, 0x00, 0x00)
+        dl.number_format = '0"%"'
         dl.number_format_is_linked = False
         dl.position = XL_LABEL_POSITION.CENTER
 
@@ -602,6 +612,203 @@ def _match_stacked_color(text: str) -> str | None:
     return None
 
 
+def _build_grouped_stacked_slide(prs, group_questions: list[tuple[str, dict]],
+                                  selected_cols: list[str], group_id: str):
+    """Grouped stacked 100% chart: each question becomes a category row,
+    answer options become the stacked segments.  Uses first selected column."""
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+
+    first_col = selected_cols[0] if selected_cols else None
+    if not first_col:
+        return
+
+    # Collect all unique answer options (order from first question)
+    all_answers: list[str] = []
+    seen_answers: set[str] = set()
+    for _, info in group_questions:
+        df = info["df"].copy()
+        df = df[~df["_answer_"].apply(_is_utility_row)].copy()
+        for ans in df["_answer_"].str.strip().tolist():
+            if ans and ans not in seen_answers:
+                all_answers.append(ans)
+                seen_answers.add(ans)
+
+    if not all_answers:
+        return
+
+    # Build lookup: question -> {answer -> value}
+    q_data: dict[str, dict[str, float]] = {}
+    for q_text, info in group_questions:
+        df = info["df"].copy()
+        df = df[~df["_answer_"].apply(_is_utility_row)].copy()
+        answer_vals: dict[str, float] = {}
+        for _, row in df.iterrows():
+            ans = str(row["_answer_"]).strip()
+            if first_col in df.columns:
+                val = float(row[first_col]) if pd.notna(row[first_col]) else 0.0
+            else:
+                val = 0.0
+            answer_vals[ans] = val
+        q_data[q_text] = answer_vals
+
+    # Categories = question names (reversed for correct visual order)
+    question_names = [q for q, _ in group_questions]
+    display_questions = list(reversed(question_names))
+
+    chart_data = CategoryChartData()
+    chart_data.categories = display_questions
+
+    for ans in all_answers:
+        vals = [q_data.get(q, {}).get(ans, 0.0) for q in display_questions]
+        chart_data.add_series(ans, vals)
+
+    chart_frame = slide.shapes.add_chart(
+        XL_CHART_TYPE.BAR_STACKED_100,
+        Inches(0.5), Inches(0.4), Inches(12.33), Inches(6.7),
+        chart_data,
+    )
+
+    chart = chart_frame.chart
+    n_values = list(dict.fromkeys(info["n_value"] for _, info in group_questions))
+    n_display = n_values[0] if len(n_values) == 1 else "/".join(n_values)
+    _set_chart_title(chart, f"Groep: {group_id}", n_display, group_id)
+
+    plot = chart.plots[0]
+    plot.gap_width = 60
+    plot.overlap = 100
+
+    _clean_axes(chart)
+
+    if chart.category_axis:
+        cat_font = chart.category_axis.tick_labels.font
+        _set_font(cat_font, size=Pt(10), color=DARK_GREY)
+
+    for s_idx, series in enumerate(plot.series):
+        label = all_answers[s_idx] if s_idx < len(all_answers) else ""
+        matched = _match_stacked_color(label.lower().strip())
+        color = matched if matched else BAR_PRIMARY
+        series.format.fill.solid()
+        series.format.fill.fore_color.rgb = hex_to_rgb(color)
+
+        series.has_data_labels = True
+        dl = series.data_labels
+        dl.show_value = True
+        dl.show_category_name = False
+        dl.show_series_name = False
+        dl.font.name = FONT_NAME
+        dl.font.size = Pt(10)
+        dl.font.color.rgb = RGBColor(0x00, 0x00, 0x00)
+        dl.number_format = '0"%"'
+        dl.number_format_is_linked = False
+        dl.position = XL_LABEL_POSITION.CENTER
+
+    chart.has_legend = True
+    chart.legend.position = XL_LEGEND_POSITION.BOTTOM
+    chart.legend.include_in_layout = False
+    _set_font(chart.legend.font, size=Pt(10))
+
+
+def _build_grouped_bar_slide(prs, group_questions: list[tuple[str, dict]],
+                              selected_cols: list[str], group_id: str):
+    """Grouped bar chart: shared answer options as categories,
+    each question becomes a separate series.  Uses first selected column."""
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+
+    first_col = selected_cols[0] if selected_cols else None
+    if not first_col:
+        return
+
+    # Collect all unique answer options
+    all_answers: list[str] = []
+    seen_answers: set[str] = set()
+    for _, info in group_questions:
+        df = info["df"].copy()
+        df = df[~df["_answer_"].apply(_is_utility_row)].copy()
+        df = _sort_bar_df(df, [first_col])
+        for ans in df["_answer_"].str.strip().tolist():
+            if ans and ans not in seen_answers:
+                all_answers.append(ans)
+                seen_answers.add(ans)
+
+    if not all_answers:
+        return
+
+    chart_data = CategoryChartData()
+    chart_data.categories = all_answers
+
+    # Each question becomes a series (reversed for correct visual order)
+    series_questions = list(reversed(group_questions))
+    for q_text, info in series_questions:
+        df = info["df"].copy()
+        df = df[~df["_answer_"].apply(_is_utility_row)].copy()
+        answer_vals: dict[str, float] = {}
+        for _, row in df.iterrows():
+            ans = str(row["_answer_"]).strip()
+            if first_col in df.columns:
+                val = float(row[first_col]) if pd.notna(row[first_col]) else 0.0
+            else:
+                val = 0.0
+            answer_vals[ans] = val
+        vals = [answer_vals.get(ans, 0.0) for ans in all_answers]
+        chart_data.add_series(q_text, vals)
+
+    chart_frame = slide.shapes.add_chart(
+        XL_CHART_TYPE.BAR_CLUSTERED,
+        Inches(0.5), Inches(0.4), Inches(12.33), Inches(6.7),
+        chart_data,
+    )
+
+    chart = chart_frame.chart
+    n_values = list(dict.fromkeys(info["n_value"] for _, info in group_questions))
+    n_display = n_values[0] if len(n_values) == 1 else "/".join(n_values)
+    _set_chart_title(chart, f"Groep: {group_id}", n_display, group_id)
+
+    plot = chart.plots[0]
+    plot.gap_width = 60
+
+    _clean_axes(chart)
+
+    if chart.category_axis:
+        cat_font = chart.category_axis.tick_labels.font
+        _set_font(cat_font, size=Pt(10), color=DARK_GREY)
+
+    colors = [BAR_PRIMARY, BAR_SECONDARY, "#FF6B81", "#A855F7"]
+    num_series = len(series_questions)
+    answers_lower = [a.strip().lower() for a in all_answers]
+
+    for s_idx, series in enumerate(plot.series):
+        color_idx = num_series - 1 - s_idx
+        base_color = colors[color_idx % len(colors)]
+        series.format.fill.solid()
+        series.format.fill.fore_color.rgb = hex_to_rgb(base_color)
+
+        for pt_idx, ans in enumerate(answers_lower):
+            if ans in BOTTOM_LABELS:
+                pt = series.points[pt_idx]
+                pt.format.fill.solid()
+                pt.format.fill.fore_color.rgb = hex_to_rgb(BAR_GREY)
+
+        series.has_data_labels = True
+        dl = series.data_labels
+        dl.show_value = True
+        dl.show_category_name = False
+        dl.show_series_name = False
+        dl.font.name = FONT_NAME
+        dl.font.size = Pt(10)
+        dl.font.color.rgb = RGBColor(0x00, 0x00, 0x00)
+        dl.number_format = '0"%"'
+        dl.number_format_is_linked = False
+        try:
+            dl.position = XL_LABEL_POSITION.OUTSIDE_END
+        except Exception:
+            pass
+
+    chart.has_legend = True
+    chart.legend.position = XL_LEGEND_POSITION.BOTTOM
+    chart.legend.include_in_layout = False
+    _set_font(chart.legend.font, size=Pt(10))
+
+
 def generate_pptx(questions_data: OrderedDict, config_df: pd.DataFrame,
                   selected_cols: list[str], template_file=None) -> bytes:
     if template_file is not None:
@@ -610,6 +817,8 @@ def generate_pptx(questions_data: OrderedDict, config_df: pd.DataFrame,
         prs = Presentation()
         prs.slide_width = SLIDE_WIDTH
         prs.slide_height = SLIDE_HEIGHT
+
+    processed_groups: set[str] = set()
 
     for _, row in config_df.iterrows():
         if not row.get("Exporteren", False):
@@ -624,10 +833,38 @@ def generate_pptx(questions_data: OrderedDict, config_df: pd.DataFrame,
 
         info = questions_data[q_text]
 
-        if chart_type == "100% Gestapeld horizontaal":
-            _build_stacked_slide(prs, q_text, info, selected_cols, group_id)
+        if group_id:
+            # Grouped slide: only generate once per group_id
+            if group_id in processed_groups:
+                continue
+            processed_groups.add(group_id)
+
+            # Collect all exported questions with this group_id
+            group_questions: list[tuple[str, dict]] = []
+            for _, r2 in config_df.iterrows():
+                if not r2.get("Exporteren", False):
+                    continue
+                g2 = str(r2.get("Groep_ID", "")).strip()
+                q2 = r2["Vraag"]
+                if g2 == group_id and q2 in questions_data:
+                    group_questions.append((q2, questions_data[q2]))
+
+            if len(group_questions) <= 1:
+                # Single question in group → treat as individual
+                if chart_type == "100% Gestapeld horizontaal":
+                    _build_stacked_slide(prs, q_text, info, selected_cols, group_id)
+                else:
+                    _build_bar_slide(prs, q_text, info, selected_cols, group_id)
+            else:
+                if chart_type == "100% Gestapeld horizontaal":
+                    _build_grouped_stacked_slide(prs, group_questions, selected_cols, group_id)
+                else:
+                    _build_grouped_bar_slide(prs, group_questions, selected_cols, group_id)
         else:
-            _build_bar_slide(prs, q_text, info, selected_cols, group_id)
+            if chart_type == "100% Gestapeld horizontaal":
+                _build_stacked_slide(prs, q_text, info, selected_cols, group_id)
+            else:
+                _build_bar_slide(prs, q_text, info, selected_cols, group_id)
 
     buf = io.BytesIO()
     prs.save(buf)
