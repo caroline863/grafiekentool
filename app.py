@@ -402,10 +402,12 @@ def _sort_bar_df(df: pd.DataFrame, data_cols: list[str]) -> pd.DataFrame:
     return pd.concat([df_bottom, df_penult, df_normal], ignore_index=True)
 
 
-def _add_title_subtitle(slide, question: str, n_value: str, group_id: str):
-    tx = slide.shapes.add_textbox(Inches(0.5), Inches(0.15), Inches(12.3), Inches(0.5))
-    tf = tx.text_frame
+def _set_chart_title(chart, question: str, n_value: str, group_id: str):
+    """Add question + basis as chart title (two paragraphs)."""
+    chart.has_title = True
+    tf = chart.chart_title.text_frame
     tf.word_wrap = True
+
     p = tf.paragraphs[0]
     p.text = question
     _set_font(p.font, size=Pt(10), bold=True, color=DARK_GREY)
@@ -414,7 +416,7 @@ def _add_title_subtitle(slide, question: str, n_value: str, group_id: str):
     basis_text = f"Basis: {group_id} (n={n_value})" if group_id else f"Basis: totaal (n={n_value})"
     p2 = tf.add_paragraph()
     p2.text = basis_text
-    _set_font(p2.font, size=Pt(8), color=MID_GREY)
+    _set_font(p2.font, size=Pt(10), bold=False, color=MID_GREY)
     p2.alignment = PP_ALIGN.CENTER
 
 
@@ -459,7 +461,6 @@ def _build_bar_slide(prs, question: str, info: dict,
         return
 
     df = _sort_bar_df(df, chart_data_cols)
-    _add_title_subtitle(slide, question, n_value, group_id)
 
     categories = df["_answer_"].tolist()
     chart_data = CategoryChartData()
@@ -467,14 +468,15 @@ def _build_bar_slide(prs, question: str, info: dict,
     for col in chart_data_cols:
         chart_data.add_series(col, df[col].fillna(0).tolist())
 
+    # Position chart within slide guides (~0.5" margins)
     chart_frame = slide.shapes.add_chart(
         XL_CHART_TYPE.BAR_CLUSTERED,
-        Inches(0.3), Inches(0.8), Inches(12.7), Inches(6.3),
+        Inches(0.5), Inches(0.4), Inches(12.33), Inches(6.7),
         chart_data,
     )
 
     chart = chart_frame.chart
-    chart.has_title = False
+    _set_chart_title(chart, question, n_value, group_id)
     plot = chart.plots[0]
     plot.gap_width = 60
 
@@ -482,7 +484,7 @@ def _build_bar_slide(prs, question: str, info: dict,
 
     if chart.category_axis:
         cat_font = chart.category_axis.tick_labels.font
-        _set_font(cat_font, color=DARK_GREY)
+        _set_font(cat_font, size=Pt(10), color=DARK_GREY)
 
     answers_lower = df["_answer_"].str.strip().str.lower().tolist()
     colors = [BAR_PRIMARY, BAR_SECONDARY, "#FF6B81", "#A855F7"]
@@ -499,11 +501,11 @@ def _build_bar_slide(prs, question: str, info: dict,
                 pt.format.fill.solid()
                 pt.format.fill.fore_color.rgb = hex_to_rgb(BAR_GREY)
 
-        # Data labels with percentage at the end of each bar
+        # Data labels — percentage at end of each bar
         series.has_data_labels = True
         dl = series.data_labels
         dl.font.name = FONT_NAME
-        dl.font.size = Pt(9)
+        dl.font.size = Pt(10)
         dl.font.color.rgb = DARK_GREY
         dl.number_format = '0"%"'
         dl.number_format_is_linked = False
@@ -518,7 +520,7 @@ def _build_bar_slide(prs, question: str, info: dict,
         chart.has_legend = True
         chart.legend.position = XL_LEGEND_POSITION.BOTTOM
         chart.legend.include_in_layout = False
-        _set_font(chart.legend.font, size=Pt(8))
+        _set_font(chart.legend.font, size=Pt(10))
 
 
 def _build_stacked_slide(prs, question: str, info: dict,
@@ -540,8 +542,6 @@ def _build_stacked_slide(prs, question: str, info: dict,
     if df.empty:
         return
 
-    _add_title_subtitle(slide, question, n_value, group_id)
-
     chart_data = CategoryChartData()
     chart_data.categories = chart_data_cols
 
@@ -551,14 +551,15 @@ def _build_stacked_slide(prs, question: str, info: dict,
         vals = [float(row[c]) if pd.notna(row[c]) else 0.0 for c in chart_data_cols]
         chart_data.add_series(label, vals)
 
+    # Position chart within slide guides (~0.5" margins)
     chart_frame = slide.shapes.add_chart(
         XL_CHART_TYPE.BAR_STACKED_100,
-        Inches(0.3), Inches(0.8), Inches(12.7), Inches(6.3),
+        Inches(0.5), Inches(0.4), Inches(12.33), Inches(6.7),
         chart_data,
     )
 
     chart = chart_frame.chart
-    chart.has_title = False
+    _set_chart_title(chart, question, n_value, group_id)
     plot = chart.plots[0]
     plot.gap_width = 60
     plot.overlap = 100
@@ -567,7 +568,7 @@ def _build_stacked_slide(prs, question: str, info: dict,
 
     if chart.category_axis:
         cat_font = chart.category_axis.tick_labels.font
-        _set_font(cat_font, color=DARK_GREY)
+        _set_font(cat_font, size=Pt(10), color=DARK_GREY)
 
     for s_idx, series in enumerate(plot.series):
         label = answer_labels[s_idx] if s_idx < len(answer_labels) else ""
@@ -579,7 +580,7 @@ def _build_stacked_slide(prs, question: str, info: dict,
         series.has_data_labels = True
         dl = series.data_labels
         dl.font.name = FONT_NAME
-        dl.font.size = Pt(8)
+        dl.font.size = Pt(10)
         dl.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
         dl.number_format = '[>=4]0"%";""'
         dl.number_format_is_linked = False
@@ -588,7 +589,7 @@ def _build_stacked_slide(prs, question: str, info: dict,
     chart.has_legend = True
     chart.legend.position = XL_LEGEND_POSITION.BOTTOM
     chart.legend.include_in_layout = False
-    _set_font(chart.legend.font, size=Pt(8))
+    _set_font(chart.legend.font, size=Pt(10))
 
 
 def _match_stacked_color(text: str) -> str | None:
@@ -602,10 +603,13 @@ def _match_stacked_color(text: str) -> str | None:
 
 
 def generate_pptx(questions_data: OrderedDict, config_df: pd.DataFrame,
-                  selected_cols: list[str]) -> bytes:
-    prs = Presentation()
-    prs.slide_width = SLIDE_WIDTH
-    prs.slide_height = SLIDE_HEIGHT
+                  selected_cols: list[str], template_file=None) -> bytes:
+    if template_file is not None:
+        prs = Presentation(template_file)
+    else:
+        prs = Presentation()
+        prs.slide_width = SLIDE_WIDTH
+        prs.slide_height = SLIDE_HEIGHT
 
     for _, row in config_df.iterrows():
         if not row.get("Exporteren", False):
@@ -641,6 +645,17 @@ def main():
     with st.sidebar:
         st.header("1. Upload Excel")
         uploaded = st.file_uploader("Kies een .xlsx bestand", type=["xlsx"])
+
+        st.header("Template (optioneel)")
+        template = st.file_uploader(
+            "Upload een .pptx template",
+            type=["pptx"],
+            help="Optioneel: upload een PowerPoint-template met jouw huisstijl en hulplijnen.",
+        )
+        if template:
+            st.session_state.template_file = io.BytesIO(template.read())
+        elif "template_file" not in st.session_state:
+            st.session_state.template_file = None
 
         if uploaded:
             if ("uploaded_name" not in st.session_state
@@ -736,8 +751,12 @@ def main():
     ):
         with st.spinner("PowerPoint wordt gegenereerd..."):
             try:
+                tpl = st.session_state.get("template_file")
+                if tpl:
+                    tpl.seek(0)
                 pptx_bytes = generate_pptx(
                     st.session_state.questions, edited, selected_cols,
+                    template_file=tpl,
                 )
             except Exception as e:
                 st.error(f"Fout bij genereren: {e}")
