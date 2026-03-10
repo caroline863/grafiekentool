@@ -117,14 +117,11 @@ def _is_utility_row(answer: str) -> bool:
     Handles multi-line values like 'n\\n%', hidden characters, padding.
     """
     clean = _clean_answer(answer).lower()
-    # Exact match
     if clean in DROP_ANSWER_OPTIONS:
         return True
-    # Multi-line: split on newlines and check if ALL parts are utility
     parts = [p.strip() for p in clean.split("\n") if p.strip()]
     if parts and all(p in DROP_ANSWER_OPTIONS for p in parts):
         return True
-    # Combined like "n %" or "n%"
     if re.match(r'^[n%\s]+$', clean) and len(clean) <= 5:
         return True
     return False
@@ -133,7 +130,6 @@ def _row_has_n(answer: str) -> bool:
     clean = _clean_answer(answer).lower()
     if clean == "n":
         return True
-    # Multi-line: one of the parts is "n"
     parts = [p.strip() for p in clean.split("\n") if p.strip()]
     return "n" in parts
 def _should_skip_row(q_cell: str, a_cell: str) -> bool:
@@ -160,10 +156,8 @@ def parse_excel(uploaded_file) -> tuple[OrderedDict, list[str]]:
     raw = pd.read_excel(uploaded_file, header=None, dtype=str)
     row0 = raw.iloc[0].fillna("").astype(str).str.strip()
     row1 = raw.iloc[1].fillna("").astype(str).str.strip()
-    # Build column names from the two header rows
     col_names: list[str] = []
     current_main = ""
-    # Characters that act as placeholder sub-headers (not real names)
     placeholder_subs = {"nan", "", "_", "-", "–", "—"}
     for idx, (main, sub) in enumerate(zip(row0, row1)):
         if main and main.lower() != "nan":
@@ -176,7 +170,6 @@ def parse_excel(uploaded_file) -> tuple[OrderedDict, list[str]]:
             col_names.append(f"_col{idx}_")
     col_names[0] = "_question_"
     col_names[1] = "_answer_"
-    # De-duplicate data column names
     seen_names: dict[str, int] = {}
     for i, name in enumerate(col_names):
         if i < 2:
@@ -210,19 +203,16 @@ def parse_excel(uploaded_file) -> tuple[OrderedDict, list[str]]:
             return
         seen_questions.add(q_key)
         df_block = pd.DataFrame(current_rows)
-        # Force _answer_ to clean strings
         df_block["_answer_"] = (
             df_block["_answer_"]
             .fillna("")
             .astype(str)
             .apply(_clean_answer)
         )
-        # ── Extract n= value BEFORE dropping utility rows ──
         n_value = "?"
         for idx_row in range(len(df_block)):
             ans = df_block.iloc[idx_row]["_answer_"]
             if _row_has_n(ans):
-                # Try first available data column for the n value
                 for dc in data_cols:
                     if dc not in df_block.columns:
                         continue
@@ -245,14 +235,11 @@ def parse_excel(uploaded_file) -> tuple[OrderedDict, list[str]]:
                         continue
                 if n_value != "?":
                     break
-        # ── Drop utility rows (n, %, topbox, bottombox) ──
         keep_mask = ~df_block["_answer_"].apply(_is_utility_row)
         df_clean = df_block[keep_mask].copy()
-        # ── Convert data columns to numeric percentages ──
         for col in data_cols:
             if col not in df_clean.columns:
                 continue
-            # Clean string values
             series = (
                 df_clean[col]
                 .fillna("")
@@ -263,7 +250,6 @@ def parse_excel(uploaded_file) -> tuple[OrderedDict, list[str]]:
                 .str.strip()
             )
             df_clean[col] = pd.to_numeric(series, errors="coerce")
-        # If all values are in 0-1 range (decimals), scale to 0-100
         all_vals = []
         for col in data_cols:
             if col in df_clean.columns:
@@ -273,7 +259,6 @@ def parse_excel(uploaded_file) -> tuple[OrderedDict, list[str]]:
                 if col in df_clean.columns:
                     df_clean[col] = df_clean[col] * 100
         answer_opts = df_clean["_answer_"].dropna().str.strip().tolist()
-        # Extra filter: remove any answer that is empty after cleaning
         answer_opts = [a for a in answer_opts if a]
         questions[q_key] = {
             "df": df_clean.reset_index(drop=True),
@@ -285,20 +270,16 @@ def parse_excel(uploaded_file) -> tuple[OrderedDict, list[str]]:
     for _, row in data.iterrows():
         q_cell = str(row["_question_"]).strip() if not _is_empty(row["_question_"]) else ""
         a_cell = str(row["_answer_"]).strip() if not _is_empty(row["_answer_"]) else ""
-        # Skip footnote rows (these ARE block separators)
         if _should_skip_row(q_cell, a_cell):
             _flush()
             current_q = None
             continue
-        # Empty row = end of block
         if not q_cell and not a_cell:
             _flush()
             continue
-        # New question starts
         if q_cell:
             _flush()
             current_q = q_cell
-        # Add row to current block (including n/% — they'll be filtered later)
         if current_q is not None and a_cell:
             current_rows.append(row.to_dict())
     _flush()
@@ -377,7 +358,6 @@ def _build_bar_slide(prs, question: str, info: dict,
     chart_data_cols = [c for c in selected_cols if c in df.columns]
     if df.empty or not chart_data_cols:
         return
-    # Extra safety: drop any remaining utility rows
     df = df[~df["_answer_"].apply(_is_utility_row)].copy()
     if df.empty:
         return
@@ -386,10 +366,8 @@ def _build_bar_slide(prs, question: str, info: dict,
     categories = df["_answer_"].tolist()
     chart_data = CategoryChartData()
     chart_data.categories = categories
-    # Reverse series order so visual top-to-bottom matches selection order
     for col in reversed(chart_data_cols):
         chart_data.add_series(col, df[col].fillna(0).tolist())
-    # Position chart within slide guides (~0.5" margins)
     chart_frame = slide.shapes.add_chart(
         XL_CHART_TYPE.BAR_CLUSTERED,
         Inches(0.5), Inches(0.4), Inches(12.33), Inches(6.7),
@@ -407,7 +385,6 @@ def _build_bar_slide(prs, question: str, info: dict,
     colors = [BAR_PRIMARY, BAR_SECONDARY, "#FF6B81", "#A855F7"]
     num_series = len(chart_data_cols)
     for s_idx, series in enumerate(plot.series):
-        # Map colors so first selected column gets primary color
         color_idx = num_series - 1 - s_idx
         base_color = colors[color_idx % len(colors)]
         series.format.fill.solid()
@@ -417,7 +394,6 @@ def _build_bar_slide(prs, question: str, info: dict,
                 pt = series.points[pt_idx]
                 pt.format.fill.solid()
                 pt.format.fill.fore_color.rgb = hex_to_rgb(BAR_GREY)
-        # Data labels — percentage at end of each bar
         series.has_data_labels = True
         dl = series.data_labels
         dl.show_value = True
@@ -449,12 +425,10 @@ def _build_stacked_slide(prs, question: str, info: dict,
     chart_data_cols = [c for c in selected_cols if c in df.columns]
     if df.empty or not chart_data_cols:
         return
-    # Extra safety: drop any remaining utility rows
     df = df[~df["_answer_"].apply(_is_utility_row)].copy()
     if df.empty:
         return
     chart_data = CategoryChartData()
-    # Reverse category order so visual top-to-bottom matches selection order
     display_cols = list(reversed(chart_data_cols))
     chart_data.categories = display_cols
     answer_labels = df["_answer_"].str.strip().tolist()
@@ -462,7 +436,6 @@ def _build_stacked_slide(prs, question: str, info: dict,
         label = str(row["_answer_"]).strip()
         vals = [float(row[c]) if pd.notna(row[c]) else 0.0 for c in display_cols]
         chart_data.add_series(label, vals)
-    # Position chart within slide guides (~0.5" margins)
     chart_frame = slide.shapes.add_chart(
         XL_CHART_TYPE.BAR_STACKED_100,
         Inches(0.5), Inches(0.4), Inches(12.33), Inches(6.7),
@@ -511,7 +484,7 @@ def _get_stacked_position_color(idx: int, total: int) -> str:
     """Fallback scale color based on position (green -> red) for stacked charts."""
     if total <= 1:
         return STACKED_SCALE_COLORS[0]
-    scale = STACKED_SCALE_COLORS[:5]  # exclude grey
+    scale = STACKED_SCALE_COLORS[:5]
     pos = idx / (total - 1)
     scale_idx = min(int(pos * (len(scale) - 1) + 0.5), len(scale) - 1)
     return scale[scale_idx]
@@ -523,7 +496,6 @@ def _build_grouped_stacked_slide(prs, group_questions: list[tuple[str, dict]],
     first_col = selected_cols[0] if selected_cols else None
     if not first_col:
         return
-    # Collect all unique answer options (order from first question)
     all_answers: list[str] = []
     seen_answers: set[str] = set()
     for _, info in group_questions:
@@ -535,7 +507,6 @@ def _build_grouped_stacked_slide(prs, group_questions: list[tuple[str, dict]],
                 seen_answers.add(ans)
     if not all_answers:
         return
-    # Build lookup: question -> {answer -> value}
     q_data: dict[str, dict[str, float]] = {}
     for q_text, info in group_questions:
         df = info["df"].copy()
@@ -549,7 +520,6 @@ def _build_grouped_stacked_slide(prs, group_questions: list[tuple[str, dict]],
                 val = 0.0
             answer_vals[ans] = val
         q_data[q_text] = answer_vals
-    # Categories = question names (reversed for correct visual order)
     question_names = [q for q, _ in group_questions]
     display_questions = list(reversed(question_names))
     chart_data = CategoryChartData()
@@ -604,7 +574,6 @@ def _build_grouped_bar_slide(prs, group_questions: list[tuple[str, dict]],
     first_col = selected_cols[0] if selected_cols else None
     if not first_col:
         return
-    # Collect all unique answer options
     all_answers: list[str] = []
     seen_answers: set[str] = set()
     for _, info in group_questions:
@@ -620,7 +589,6 @@ def _build_grouped_bar_slide(prs, group_questions: list[tuple[str, dict]],
         return
     chart_data = CategoryChartData()
     chart_data.categories = all_answers
-    # Each question becomes a series (reversed for correct visual order)
     series_questions = list(reversed(group_questions))
     for q_text, info in series_questions:
         df = info["df"].copy()
@@ -702,11 +670,9 @@ def generate_pptx(questions_data: OrderedDict, config_df: pd.DataFrame,
             continue
         info = questions_data[q_text]
         if group_id:
-            # Grouped slide: only generate once per group_id
             if group_id in processed_groups:
                 continue
             processed_groups.add(group_id)
-            # Collect all exported questions with this group_id + their grey labels
             group_questions: list[tuple[str, dict]] = []
             group_grey: set[str] = set()
             for _, r2 in config_df.iterrows():
@@ -720,7 +686,6 @@ def generate_pptx(questions_data: OrderedDict, config_df: pd.DataFrame,
                     if gl2:
                         group_grey.add(gl2.lower())
             if len(group_questions) <= 1:
-                # Single question in group -> treat as individual
                 if chart_type == "100% Gestapeld horizontaal":
                     _build_stacked_slide(prs, q_text, info, selected_cols, group_id)
                 else:
@@ -868,7 +833,7 @@ def _get_logo_html() -> str:
     logo_path = Path(__file__).parent / "logo.png"
     if logo_path.exists():
         b64 = base64.b64encode(logo_path.read_bytes()).decode()
-        return f'<img src="data:image/png;base64,{b64}" style="height:42px;filter:brightness(0) invert(1);" alt="Ruigrok">'
+        return f'<img src="data:image/png;base64,{b64}" style="height:42px;" alt="Ruigrok">'
     # Fallback: inline SVG
     return (
         '<svg viewBox="0 0 200 48" xmlns="http://www.w3.org/2000/svg" style="height:42px;">'
@@ -971,7 +936,6 @@ def main():
         return
     st.header("Regie Tabel")
     st.caption("Pas instellingen per vraag aan. Vink 'Exporteren' aan voor opname in de PowerPoint.")
-    # Show main config table WITHOUT the grey column (handled separately below)
     display_df = st.session_state.config_df.drop(columns=["Grijs (onderaan)"], errors="ignore")
     edited = st.data_editor(
         display_df,
@@ -992,23 +956,20 @@ def main():
         key="regie_editor",
     )
     # ── Per-vraag "Grijs (onderaan)" selectie ──
-    # Only show for exported questions; each gets its own answer options
     questions = st.session_state.questions
     grey_values = st.session_state.config_df["Grijs (onderaan)"].tolist() if "Grijs (onderaan)" in st.session_state.config_df.columns else [""] * len(edited)
-    with st.expander("Grijs label instellen (per vraag)", expanded=False):
-        st.caption("Kies per vraag welk antwoord grijs onderaan de grafiek moet staan.")
+    with st.expander("Alternatieve 'weet ik niet' selecteren (grijze kleur)", expanded=False):
+        st.caption("Kies per vraag welk antwoord grijs en onderaan de grafiek moet worden weergegeven.")
         new_grey = []
         for idx, row in edited.iterrows():
             q_text = row["Vraag"]
             if not row.get("Exporteren", False):
                 new_grey.append(grey_values[idx] if idx < len(grey_values) else "")
                 continue
-            # Get answer options for THIS specific question
             q_options = ["(geen)"]
             if q_text in questions:
                 q_options += questions[q_text]["answer_options"]
             current_grey = grey_values[idx] if idx < len(grey_values) else ""
-            # Find index of current value in options
             default_idx = 0
             if current_grey and current_grey in q_options:
                 default_idx = q_options.index(current_grey)
@@ -1020,11 +981,9 @@ def main():
                 label_visibility="visible",
             )
             new_grey.append("" if selected_grey == "(geen)" else selected_grey)
-    # Merge grey values back into config_df
     merged = edited.copy()
     merged["Grijs (onderaan)"] = new_grey
     st.session_state.config_df = merged
-    # ── Debug info (collapsed, alleen zichtbaar in debug mode) ──
     if DEBUG_MODE:
         with st.expander("Debug: data per vraag"):
             questions = st.session_state.questions
@@ -1041,7 +1000,6 @@ def main():
         st.warning("Selecteer minstens een kolom in de sidebar.")
         return
     export_count = int(edited["Exporteren"].sum())
-    # Stats overview
     col1, col2, col3 = st.columns(3)
     with col1:
         st.markdown(f'<div class="stat-box"><div class="label">Totaal vragen</div><div class="value">{len(edited)}</div></div>', unsafe_allow_html=True)
@@ -1061,7 +1019,7 @@ def main():
                 if tpl:
                     tpl.seek(0)
                 pptx_bytes = generate_pptx(
-                    st.session_state.questions, edited, selected_cols,
+                    st.session_state.questions, st.session_state.config_df, selected_cols,
                     template_file=tpl,
                 )
             except Exception as e:
@@ -1078,3 +1036,4 @@ def main():
         )
 if __name__ == "__main__":
     main()
+
